@@ -31,7 +31,6 @@ for different head dimensions (40, 48, 64, 128, 80, 88, 96), but I'm still not 1
 that there are none left for other head dimensions.
 
 Differences between this Triton version and the CUDA version:
-- Triton version doesn't support dropout.
 - Triton forward is generally faster than CUDA forward, while Triton backward is
 generally slower than CUDA backward. Overall Triton forward + backward is slightly slower
 than CUDA forward + backward.
@@ -65,7 +64,7 @@ import triton.language as tl
 )
 @triton.jit
 def _fwd_kernel(
-    Q, K, V, Bias, Out,
+    Q, K, V, Bias, Out, SEEDS,
     Lse, TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
     softmax_scale,
     stride_qb, stride_qh, stride_qm,
@@ -75,6 +74,7 @@ def _fwd_kernel(
     stride_ob, stride_oh, stride_om,
     nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
     CACHE_KEY_SEQLEN_Q, CACHE_KEY_SEQLEN_K,
+    dropout_p: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -195,8 +195,21 @@ def _fwd_kernel(
                 v = tl.load(v_ptrs + start_n * stride_vn,
                             mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                             other=0.0)
-        p = p.to(v.dtype)
-        acc_o += tl.dot(p, v)
+        #p to pdropout
+        # Seed for dropout
+        seed = tl.load(SEEDS + start_n, mask=offs_n < nheads)
+
+        # Perform dropout on p
+        random = tl.rand(seed, offs_n)
+        p_keep = random > p
+        p_dropout = tl.where(p_keep, p / (1 - p), 0.0)
+
+
+        
+        #p = p.to(v.dtype)
+        p_dropout = pdropout.to(v.dtype)
+        #acc_o += tl.dot(p, v)
+        acc_o += tl.dot(p_dropout, v)
 
         # -- update statistics
         m_i = m_ij
@@ -288,6 +301,7 @@ def _bwd_kernel_one_col_block(
     stride_qm, stride_kn, stride_vn, stride_bm,
     stride_dom, stride_dqm, stride_dkn, stride_dvn,
     seqlen_q, seqlen_k, headdim,
+    dropout_p: tl.constexpr,
     ATOMIC_ADD: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -393,6 +407,23 @@ def _bwd_kernel_one_col_block(
         else:
             p = tl.exp(qk - lse_i[:, None])
         # compute dv
+
+        ################# add dropout
+        # Seed for dropout
+        seed = tl.load(SEEDS + start_n, mask=offs_n < nheads)
+
+        # Perform dropout on p
+        random = tl.rand(seed, offs_n)
+        p_keep = random > p
+        #p_dropout = tl.where(p_keep, p / (1 - p), 0.0)
+        Z = tl.where(p_keep, 1 / (1 - prob), 0.0)
+        p_dropout = tl.dot(p, Z, trans_a=True)
+
+        dv += tl.dot(p.to(do.dtype), do, trans_a=True)
+
+
+
+
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
         # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
         # in the case of headdim=48/96, seqlen_q & seqlen_k >= 512. If headdim=40 or seqlen < 512,
@@ -581,7 +612,7 @@ def _bwd_kernel(
         )
 
 
-def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
+def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None, p):
     # shape constraints
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
